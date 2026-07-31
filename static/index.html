@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NVIDIA PersonaPlex style — Michi-Adapter Live Voice</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="background-glow"></div>
+    <div class="background-grid"></div>
+
+    <header class="app-header">
+        <div class="brand">
+            <div class="logo-orb"></div>
+            <div>
+                <h1>Michi-PersonaPlex</h1>
+                <span class="subtitle">Full-Duplex Speech-to-Speech Engine • Escenario B</span>
+            </div>
+        </div>
+        <div class="status-badge" id="server-status">
+            <span class="pulse-dot"></span>
+            <span class="status-text">Conectando al servidor...</span>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <!-- Center Stage: Glowing Orb / Waveform Visualizer -->
+        <section class="visualizer-card glass-panel">
+            <div class="persona-selector-row">
+                <label for="persona-select">Persona Activa:</label>
+                <select id="persona-select" class="glass-select">
+                    <option value="michi-default">🐱 Michi — Asistente Conversacional Argentino</option>
+                    <option value="michi-tech">💻 Michi — Arquitecto AI & PyTorch</option>
+                    <option value="michi-creative">🎨 Michi — Creativo & Rápido</option>
+                </select>
+            </div>
+
+            <div class="orb-container">
+                <canvas id="waveform-canvas" width="600" height="240"></canvas>
+                <div class="orb-status-overlay" id="orb-status-text">LISTO PARA CONVERSAR</div>
+            </div>
+
+            <!-- Action Controls -->
+            <div class="controls-row">
+                <button id="btn-mic" class="btn btn-primary btn-glow">
+                    <span class="icon">🎙️</span>
+                    <span id="btn-mic-text">Hablar por Micrófono</span>
+                </button>
+                <button id="btn-demo" class="btn btn-secondary">
+                    <span class="icon">⚡</span>
+                    <span>Probar Respuesta Instantánea (Demo 3s)</span>
+                </button>
+            </div>
+        </section>
+
+        <!-- Right / Bottom: Live Real-Time Diagnostics & Transcript -->
+        <section class="diagnostics-panel">
+            <div class="stats-grid">
+                <div class="stat-card glass-panel">
+                    <span class="stat-label">LATENCIA DE INFERENCIA</span>
+                    <span class="stat-value" id="stat-latency">-- ms</span>
+                    <span class="stat-sub">Objetivo < 80ms</span>
+                </div>
+                <div class="stat-card glass-panel">
+                    <span class="stat-label">REAL-TIME FACTOR (RTF)</span>
+                    <span class="stat-value" id="stat-rtf">-- x</span>
+                    <span class="stat-sub">Velocidad vs Tiempo Real</span>
+                </div>
+                <div class="stat-card glass-panel">
+                    <span class="stat-label">PESOS CARGADOS</span>
+                    <span class="stat-value highlight">Phase 3 SFT</span>
+                    <span class="stat-sub">adapter_phase3_sft.pt</span>
+                </div>
+            </div>
+
+            <div class="transcript-card glass-panel">
+                <div class="transcript-header">
+                    <h3>💬 Transcripción en Vivo</h3>
+                    <span class="badge-duplex">Full-Duplex WebAudio</span>
+                </div>
+                <div class="transcript-body" id="transcript-box">
+                    <div class="msg system-msg">
+                        <span class="sender">Sistema:</span>
+                        <span class="text">Servidor conectado con Gemma 4 E2B backbone swap (Fase 3 SFT conversacional). Hablá o presioná "Probar Respuesta Instantánea" para testear en tiempo real.</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="app-footer">
+        <p>Corriendo 100% local en <code>D:\michi-adapter\</code> • AMD Radeon RX 6800 / CPU Windows • 0 Dependencias en Nube</p>
+    </footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

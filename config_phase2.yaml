@@ -1,0 +1,40 @@
+# Michi-Adapter Phase 2 Configuration
+# Target Hardware: NVIDIA H100 80GB or A100 40GB/80GB on Lightning AI
+# Estimated Budget Cap: $5.00 - $10.00 USD
+
+phase: 2
+project: "michi-adapter-backbone-swap"
+teamspace: "llm-development-project"
+studio_name: "michi-adapter-train"
+
+model:
+  mimi_dim: 1024
+  gemma_dim: 2048
+  mimi_vocab: 4096
+  base_llm: "google/gemma-4-E2B"
+  backbone_quantization: "QAT_mobile_GGUF"
+
+dataset:
+  hf_dataset_id: "kyutai/DailyTalkContiguous"
+  sample_rate: 16000
+  seq_len: 64
+  chunk_duration_sec: 5.0
+  streaming: true
+
+training:
+  phase1_checkpoint: "adapter.pt"
+  phase2_checkpoint: "adapter_phase2.pt"
+  steps: 1000
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  warmup_steps: 50
+  scheduler: "cosine"
+  log_every: 10
+
+hardware:
+  target_gpu: "H100"
+  vram_peak_estimated_gb: 4.5
+  max_runtime_minutes: 45
+  auto_stop: true
