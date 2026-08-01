@@ -18,6 +18,11 @@ os.environ["HF_TOKEN"] = HF_TOKEN
 SAMPLE_RATE = 24000
 MIC_RATE = 16000
 
+# Prompt mode: "full" (33 tokens) | "minimal" (22 tokens) | "audio_removed" (10 tokens)
+# minimal removes "en español, breve." -> just "Responde."
+# audio_removed also removes the [Audio: N mel frames] line (only if Gemma ignores it)
+PROMPT_MODE = "minimal"
+
 # ─── Phase 1: Load ALL models upfront ────────────────────────────────────────
 print("[1/7] Loading Gemma 4 E2B GGUF...")
 from llama_cpp import Llama
@@ -117,8 +122,19 @@ tts_thread.start()
 print("[4/7] TTS worker started")
 
 # ─── Audio Utils ──────────────────────────────────────────────────────────────
+# Echo mitigation: when speaker is playing, raise VAD threshold to ignore echo bleed
+speaker_active = False
+def set_speaker_active(active):
+    global speaker_active
+    speaker_active = active
+
 def is_speech(pcm, thr=0.015):
-    return np.abs(pcm).mean() > thr
+    """VAD: returns True if pcm contains speech. Raises threshold when speaker active to mitigate echo."""
+    base = np.abs(pcm).mean()
+    if speaker_active:
+        # Raise threshold 3x when speaker playing — echo bleed won't trigger VAD
+        return base > thr * 3.0
+    return base > thr
 
 def mel_spec(pcm):
     x = torch.from_numpy(pcm).float().unsqueeze(0)
@@ -130,12 +146,88 @@ def mel_spec(pcm):
         torch.ones(128, 1025)*0.01).relu()
     return mel[:, :128].numpy()
 
+# ─── Streaming early-exit logic ─────────────────────────────────────────────────
+# Gemma (and most Gemma-instruct variants) emits specific patterns when done:
+#   1. Sentence-ending punctuation: . ! ?  (but NOT abbreviations like "Dr." "U.")
+#   2. <end_of_turn> token appears IN the stream (model wrote the stop marker itself)
+#   3. A second <start_of_turn>user appears (model yielded to next turn — done)
+#   4. Repetitive token cycles: "jajajaja" or "si si si si" → loop detected
+#   5. Very short complete phrases (3-15 chars): "si", "no", "hola", "tal vez"
+
+def should_stop_streaming(text_so_far: str, token_count: int, recent_tokens: list) -> bool:
+    """
+    Returns True when Gemma has naturally finished its response and streaming
+    should stop early (before max_tokens=180 is reached).
+
+    Detection order (cheapest checks first):
+      1. Punctuation end       — last 5 tokens end with sentence closer
+      2. Turn-control tokens   — <end_of_turn> or second <start_of_turn> seen
+      3. Repetition            — same token 4+ times, or 2-token cycle 3+ times
+      4. Short complete phrase — 3-15 chars, all alphabetic, no pending continuation
+    """
+    # ── 1. Punctuation end ──────────────────────────────────────────────────────
+    # Check last 8 chars (covers token boundaries).  Avoid false positives from
+    # abbreviations by requiring space or line-start BEFORE the punctuation.
+    _PUNCT = frozenset(".!?")
+    last8 = text_so_far[-8:] if len(text_so_far) >= 8 else text_so_far
+    for i, ch in enumerate(last8):
+        if ch in _PUNCT:
+            # Grab the character IMMEDIATELY before the punctuation (if any)
+            if i > 0:
+                before = last8[i - 1]
+                # Allow . after letters/numbers that form abbreviations or decimals
+                if ch == "." and (before.isdigit() or before.lower() in "abcdefghijklmnopqrstuvwxyz"):
+                    continue   # might be "Dr." / "3.14" — skip this one, keep scanning
+            # Got a clean sentence end
+            return True
+
+    # ── 2. Turn-control tokens ───────────────────────────────────────────────────
+    if "<end_of_turn>" in text_so_far:
+        return True
+    # Second <start_of_turn> (user turn) means model yielded — done
+    if text_so_far.count("<start_of_turn>") >= 2:
+        return True
+
+    # ── 3. Repetition / looping detection ────────────────────────────────────────
+    if len(recent_tokens) >= 4:
+        # 3a. Same token 4+ consecutive times
+        if all(t == recent_tokens[-1] for t in recent_tokens[-4:]):
+            return True
+        # 3b. 2-token cycle repeated 3 times: [A, B, A, B, A, B]
+        if len(recent_tokens) >= 6:
+            cycle = recent_tokens[-2:]
+            if (cycle[0] == cycle[1]) is False:  # make sure it's not a single repeating token
+                candidate = recent_tokens[-6:]
+                if (candidate[0] == cycle[0] and candidate[1] == cycle[1] and
+                    candidate[2] == cycle[0] and candidate[3] == cycle[1] and
+                    candidate[4] == cycle[0] and candidate[5] == cycle[1]):
+                    return True
+
+    # ── 4. Short complete phrase (short responses: "si", "no", "hola") ──────────
+    # Only trigger after at least 3 tokens AND the text is clearly done (no trailing
+    # spaces, no open brackets, starts with capital or is all-lowercase common words)
+    stripped = text_so_far.strip()
+    short_words = frozenset({
+        "si", "no", "hola", "adiós", "gracias", "de nada",
+        "bueno", "vale", "ok", "okay", "ay", "eh", "mmm",
+        "tal vez", "quizá", "quizas", "es posible",
+        "perfecto", "entendido", "claro", "obvio",
+    })
+    # Must be a short alphabetic-only phrase (possibly accented)
+    if (3 <= token_count <= 20 and
+        1 < len(stripped) <= 15 and
+        stripped.lower() in short_words):
+        return True
+
+    return False
+
+
 # ─── Phase 3: Full-duplex loop ─────────────────────────────────────────────────
 def full_duplex(segment: np.ndarray, context: str = "") -> np.ndarray:
     """
     Process mic segment:
     1. mel → Gemma (streaming tokens)
-    2. Every 5 tokens → send to TTS queue (background)
+    2. Every 3 tokens → send to TTS queue (background)
     3. Collect TTS audio as it comes
     4. Return concatenated audio
     """
@@ -144,7 +236,27 @@ def full_duplex(segment: np.ndarray, context: str = "") -> np.ndarray:
     mel_pad = np.pad(mel, ((0,0),(0, 896)), mode='constant')
     _ = mel_pad @ in_proj.T  # warm-up projection
 
-    prompt = f"""<start_of_turn>user
+    # Build prompt based on PROMPT_MODE to minimize token overhead per call.
+    # Turn format (<start_of_turn>/<end_of_turn>) is required for Gemma.
+    # Token overhead per mode (approx):
+    #   full:         ~33 tokens  (<start...> + [Audio: N] + "Responde en español, breve." + <end...>)
+    #   minimal:      ~22 tokens  (<start...> + [Audio: N] + "Responde." + <end...>)
+    #   audio_removed: ~10 tokens (<start...> + "Responde." + <end...>)  -- only if Gemma ignores the audio line
+    if PROMPT_MODE == "audio_removed":
+        prompt = f"""<start_of_turn>user
+Responde.
+<end_of_turn>
+<start_of_turn>model
+"""
+    elif PROMPT_MODE == "minimal":
+        prompt = f"""<start_of_turn>user
+[Audio: {T} mel frames]
+Responde.
+<end_of_turn>
+<start_of_turn>model
+"""
+    else:  # full (default)
+        prompt = f"""<start_of_turn>user
 [Audio: {T} mel frames]
 {context}
 <end_of_turn>
@@ -159,6 +271,9 @@ def full_duplex(segment: np.ndarray, context: str = "") -> np.ndarray:
     # Warm up TTS worker with a flush signal
     tts_queue.put(("flush", None))
 
+    # Track recent tokens for repetition / cycle detection
+    recent_tokens = []
+
     # Stream tokens from Gemma
     stream_out = llm(prompt, max_tokens=180,
                     stop=["<end_of_turn>"], echo=False, stream=True)
@@ -169,13 +284,18 @@ def full_duplex(segment: np.ndarray, context: str = "") -> np.ndarray:
         tokens_buffer += token_text
         token_count += 1
 
-        # Every 5 tokens, send to TTS queue
-        if token_count % 5 == 0 and tokens_buffer.strip():
+        # Keep last 8 tokens for repetition detection
+        recent_tokens.append(token_text)
+        if len(recent_tokens) > 8:
+            recent_tokens.pop(0)
+
+        # Every 3 tokens, send to TTS queue
+        if token_count % 3 == 0 and tokens_buffer.strip():
             tts_queue.put(("text", tokens_buffer.strip()))
             tokens_buffer = ""
 
-        # Early exit on sentence end
-        if len(full_text) > 20 and any(e in full_text[-5:] for e in ".!?"):
+        # Smart early exit — all stop conditions handled in should_stop_streaming
+        if token_count > 2 and should_stop_streaming(full_text, token_count, recent_tokens):
             break
 
     # Flush remaining
@@ -212,6 +332,11 @@ q_out = queue.Queue()        # pending audio to play
 play_event = threading.Event()
 stop_event = threading.Event()
 
+# ── VAD Tuning ──────────────────────────────────────────────────────────────
+SPEECH_THRESHOLD  = 0.012   # was 0.015 — slightly more sensitive to soft speech
+SILENCE_THRESHOLD = 10      # was 15 — 10 * 160ms = 1.6s (natural turn-taking gap)
+MIN_TALK_BUFFER   = 0.8     # was 1.0 — seconds of audio before we consider user "talking"
+
 def audio_cb(indata, frames, time_info, status):
     """Non-blocking mic callback — always returns quickly."""
     if status: print(f"[VAD] {status}")
@@ -227,8 +352,10 @@ def play_cb(outdata, frames, time_info, status):
         chunk = q_out.get_nowait()
         outdata[:, 0] = chunk
         play_event.set()  # signal we started playing
+        set_speaker_active(True)  # speaker is emitting audio
     except queue.Empty:
         outdata[:, 0] = 0
+        set_speaker_active(False)  # speaker idle
 
 def live_loop():
     print("[5/7] Opening streams...")
@@ -253,13 +380,13 @@ def live_loop():
                 buf = np.concatenate([buf, chunk])
                 buf = buf[-MIC_RATE * 6:]
 
-                if is_speech(chunk):
+                if is_speech(chunk, thr=SPEECH_THRESHOLD):
                     silence = 0
-                    if not talking and len(buf) >= MIC_RATE * 1.0:
+                    if not talking and len(buf) >= MIC_RATE * MIN_TALK_BUFFER:
                         talking = True
                 else:
                     silence += 1
-                    if silence > 15 and talking:
+                    if silence > SILENCE_THRESHOLD and talking:
                         talking = False
                         seg = buf.copy()
                         buf = np.zeros(0, dtype=np.float32)
@@ -267,7 +394,7 @@ def live_loop():
                         print(f"\n    → {dur:.1f}s spoken, processing...")
                         play_event.clear()
                         t0 = time.time()
-                        out = full_duplex(seg, "Responde en espanol, breve.")
+                        out = full_duplex(seg, "" if PROMPT_MODE != "full" else "Responde en español, breve.")
                         elapsed = time.time() - t0
                         print(f"    → {len(out)/SAMPLE_RATE:.1f}s audio in {elapsed:.1f}s (overlap mode)")
                         q_out.put(out)   # non-blocking — plays as callback drains it
@@ -285,7 +412,7 @@ def demo():
     print("\n[Demo] Full pipeline test...")
     # synthetic mic segment
     seg = np.sin(2*np.pi*220*np.linspace(0, 1.5, int(MIC_RATE*1.5))).astype(np.float32)*0.04
-    out = full_duplex(seg, "Di hola y.presentate en espanol.")
+    out = full_duplex(seg, "" if PROMPT_MODE != "full" else "Di hola y.presentate en español.")
     print(f"[Demo] {out.shape[0]/SAMPLE_RATE:.1f}s audio")
     sf.write(r"D:/michi-adapter/response_fd.wav", out, SAMPLE_RATE)
     try:
