@@ -62,6 +62,51 @@ python app_michi_streaming.py --mode demo   # synthetic test
 python app_michi_streaming.py --mode mic     # live full-duplex
 ```
 
+## ## Michi-Lite (Apple Silicon, lightweight)
+
+`app_michi_lite.py` is the **working** full-duplex path on M1/M2/M3 — no
+trained Gemma-adapter checkpoints, no GGUF, no llama.cpp. Runs entirely on
+MLX + MPS.
+
+Pipeline:
+```
+Mic 16kHz → Silero VAD → mlx-whisper-tiny (STT)
+  → mlx-lm Qwen2.5-0.5B-Instruct-4bit (LLM, ES)
+  → mlx-audio Kokoro-82M-bf16 (TTS) → Speaker 24kHz
+```
+
+Full-duplex design:
+- `sd.InputStream` callback always non-blocking
+- `sd.OutputStream` callback drains a play queue
+- Speaker-active flag raises VAD threshold ×3 to suppress echo bleed
+- Barge-in: new speech while TTS playing flushes the play queue
+- All config via env vars (no hardcoded `D:/` or `E:/` paths)
+
+Setup + run:
+```bash
+pip install sounddevice soundfile mlx-whisper mlx-lm mlx-audio silero-vad scipy
+python app_michi_lite.py --mode demo   # one-shot synth, no mic
+python app_michi_lite.py --mode mic    # live full-duplex mic+speaker
+```
+
+Env vars (override defaults):
+| Var | Default |
+|---|---|
+| `MICHI_STT` | `mlx-community/whisper-tiny-mlx` |
+| `MICHI_LLM` | `mlx-community/Qwen2.5-0.5B-Instruct-4bit` |
+| `MICHI_TTS` | `mlx-community/Kokoro-82M-bf16` |
+| `MICHI_VOICE` | `af_heart` |
+| `MICHI_TTS_LANG` | `es` |
+| `MICHI_SYSTEM` | short Spanish persona |
+| `MICHI_MAX_TOKENS` | `80` |
+| `MICHI_FULL_DUPLEX` | `1` |
+| `MICHI_ECHO_GAIN` | `3.0` |
+
+This is the path that runs on a stock MacBook Air (M1, 8GB). The original
+Gemma-4-E2B + Mimi adapter pipeline (`app_michi_streaming.py`) stays as the
+high-end / heavy-compute path — train the adapter checkpoints first, then
+deploy on a 16GB-VRAM box.
+
 ## License
 
 MIT — use freely.
