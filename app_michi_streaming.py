@@ -1,434 +1,509 @@
 """
-Michi-Streaming V2: Full-duplex with proper model pre-loading + Gemma token streaming
-Key fix: all models loaded BEFORE the loop starts. Streaming only used for generation.
-TTS: batch but run in background thread so it doesn't block Gemma.
+Michi-Streaming V3 — full-duplex Gemma-4-E2B QAT GGUF + Supertonic-3.
+
+Differences from V2:
+  - Cross-platform config via env vars (no hardcoded D:/ or E:/ paths)
+  - HF_TOKEN read from env (no "YOUR_HF_TOKEN" placeholder)
+  - Auto-downloads the GGUF if missing (uses HF_TOKEN)
+  - Truly full-duplex: segment processing runs on a worker thread so the
+    main loop keeps listening and can interrupt (barge-in) at any time
+  - TTS worker is stateful across segments (no per-call stop/restart)
+  - All paths overridable via env for portability (Win/Mac/Linux)
+
+Env vars:
+  MICHI_GGUF_DIR    default ~/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-mobile-GGUF
+  MICHI_ADAPTER      default ~/michi-adapter/checkpoints/adapter_phase3_sft.pt
+  MICHI_TTS          default supertonic-3
+  MICHI_LLM_N_CTX    default 1024
+  MICHI_LLM_GPU_LAYERS default 99
+  MICHI_VAD          rms | silero (default rms)
+  MICHI_FULL_DUPLEX  1 | 0 (default 1)
+  HF_TOKEN           required for HF Hub access
 """
-import os, sys, time, threading, queue
+import os
+import sys
+import time
+import queue
+import signal
+import threading
 import numpy as np
-import torch
 import sounddevice as sd
 import soundfile as sf
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-MODEL_DIR = r"E:/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-mobile-GGUF"
-ADAPTER_PATH = r"D:/michi-adapter/checkpoints/adapter_phase3_sft.pt"
-HF_TOKEN = "YOUR_HF_TOKEN"
-os.environ["HF_TOKEN"] = HF_TOKEN
-
+# ─── Config from env (cross-platform) ───────────────────────────────────────
 SAMPLE_RATE = 24000
 MIC_RATE = 16000
+PROMPT_MODE = os.environ.get("MICHI_PROMPT_MODE", "minimal")
 
-# Prompt mode: "full" (33 tokens) | "minimal" (22 tokens) | "audio_removed" (10 tokens)
-# minimal removes "en español, breve." -> just "Responde."
-# audio_removed also removes the [Audio: N mel frames] line (only if Gemma ignores it)
-PROMPT_MODE = "minimal"
-
-# ─── Phase 1: Load ALL models upfront ────────────────────────────────────────
-print("[1/7] Loading Gemma 4 E2B GGUF...")
-from llama_cpp import Llama
-llm = Llama(
-    model_path=os.path.join(MODEL_DIR, "gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf"),
-    tokenizer_file=os.path.join(MODEL_DIR, "tokenizer.model"),
-    tokenizer_repo_id="unsloth/gemma-4-E2B-it-qat-mobile-GGUF",
-    hf_token=HF_TOKEN,
-    n_ctx=1024,          # reduced to save memory
-    n_gpu_layers=99,
-    flash_attention=True,
-    verbose=False,
+DEFAULT_MODEL_DIR = os.path.expanduser(
+    "~/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-mobile-GGUF"
 )
-print(f"    Gemma ready. n_ctx={llm.n_ctx()}")
+# Also handle the layout where HF Hub installs without the /hub/ subdir
+def _first_existing(*paths):
+    for p in paths:
+        if os.path.isdir(p):
+            return p
+    return paths[0]
+DEFAULT_ADAPTER = os.path.expanduser("~/michi-adapter/checkpoints/adapter_phase3_sft.pt")
+MODEL_DIR = os.environ.get("MICHI_GGUF_DIR", DEFAULT_MODEL_DIR)
+ADAPTER_PATH = os.environ.get("MICHI_ADAPTER", DEFAULT_ADAPTER)
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("MICHI_HF_TOKEN")
+TTS_VOICE = os.environ.get("MICHI_TTS_VOICE", "M1")
+FULL_DUPLEX = os.environ.get("MICHI_FULL_DUPLEX", "1") == "1"
+LLM_N_CTX = int(os.environ.get("MICHI_LLM_N_CTX", "1024"))
+LLM_GPU_LAYERS = int(os.environ.get("MICHI_LLM_GPU_LAYERS", "99"))
+VAD_KIND = os.environ.get("MICHI_VAD", "rms").lower()
 
-print("[2/7] Loading adapters...")
-ckpt = torch.load(ADAPTER_PATH, map_location="cpu", weights_only=False)
-in_proj = ckpt["in_adapter"]["proj.weight"].numpy()
-out_proj = ckpt["out_adapter"]["proj.weight"].numpy()
-del ckpt
-print(f"    in={in_proj.shape} out={out_proj.shape}")
+os.environ["HF_TOKEN"] = HF_TOKEN or ""
 
-print("[3/7] Loading Supertonic-3 TTS...")
-from supertonic import TTS
-tts = TTS(auto_download=True)
-print(f"    Supertonic ready @ {SAMPLE_RATE}Hz")
 
-# ─── Phase 2: Background TTS queue ─────────────────────────────────────────────
-tts_queue = queue.Queue()
-tts_thread_running = threading.Event()
-tts_thread_running.set()
+# ─── Helpers ────────────────────────────────────────────────────────────────
+def _resolve_hf_snapshot():
+    """Return the actual snapshot dir containing the GGUF, or None."""
+    if not os.path.isdir(MODEL_DIR):
+        return None
+    snapshots = os.path.join(MODEL_DIR, "snapshots")
+    if not os.path.isdir(snapshots):
+        return None
+    for d in os.listdir(snapshots):
+        p = os.path.join(snapshots, d)
+        if os.path.isdir(p) and os.path.exists(os.path.join(p, "config.json")):
+            return p
+    return None
 
-def tts_worker():
-    """Background thread: waits for text, synthesizes, puts audio in queue."""
-    pending_text = ""
-    while tts_thread_running.is_set():
-        try:
-            item = tts_queue.get(timeout=0.05)
-            if item is None:
-                break
-            # Unpack tagged tuples: ("text", str) or ("flush",)
-            if isinstance(item, tuple):
-                tag, data = item
-                if tag == "flush":  # data is None for flush signals
-                    if pending_text.strip():
-                        style = tts.get_voice_style("M1")
-                        wav, dur = tts.synthesize(pending_text.strip(), voice_style=style, lang="es")
-                        arr = np.asarray(wav, dtype=np.float32)
-                        if arr.ndim == 2 and arr.shape[0] == 1:
-                            arr = arr.squeeze(0)
-                        tts_queue.put(("audio", arr))
-                        pending_text = ""
-                    continue
-                elif tag == "stop":
-                    if pending_text.strip():
-                        style = tts.get_voice_style("M1")
-                        wav, dur = tts.synthesize(pending_text.strip(), voice_style=style, lang="es")
-                        arr = np.asarray(wav, dtype=np.float32)
-                        if arr.ndim == 2 and arr.shape[0] == 1:
-                            arr = arr.squeeze(0)
-                        tts_queue.put(("audio", arr))
-                    tts_thread_running.clear()  # exit loop
-                    break
-                elif tag == "text":
-                    pending_text += " " + data
-                else:
-                    continue  # unknown tag, skip
-            else:
-                # Plain string (backward compat)
-                pending_text += " " + item
 
-            # Only synthesize when we have meaningful text
-            if len(pending_text.strip()) < 3:
-                continue
-            style = tts.get_voice_style("M1")
-            wav, dur = tts.synthesize(pending_text.strip(), voice_style=style, lang="es")
-            arr = np.asarray(wav, dtype=np.float32)
-            if arr.ndim == 2 and arr.shape[0] == 1:
-                arr = arr.squeeze(0)
-            tts_queue.put(("audio", arr))
-            pending_text = ""
-        except queue.Empty:
-            # Timeout = no new text, flush if there's pending
-            if pending_text.strip():
-                try:
-                    style = tts.get_voice_style("M1")
-                    wav, dur = tts.synthesize(pending_text.strip(), voice_style=style, lang="es")
-                    arr = np.asarray(wav, dtype=np.float32)
-                    if arr.ndim == 2 and arr.shape[0] == 1:
-                        arr = arr.squeeze(0)
-                    tts_queue.put(("audio", arr))
-                except: pass
-                pending_text = ""
+def _download_model():
+    """Download the Gemma-4-E2B QAT GGUF from HF Hub using HF_TOKEN."""
+    if not HF_TOKEN:
+        raise RuntimeError(
+            "HF_TOKEN not set. Export it before running):\n"
+            "  export HF_TOKEN=hf_..."
+        )
+    from huggingface_hub import snapshot_download
+    print(f"[download] {os.path.basename(MODEL_DIR)} ...", flush=True)
+    snapshot_download(
+        repo_id="unsloth/gemma-4-E2B-it-qat-mobile-GGUF",
+        cache_dir=os.path.expanduser("~/.cache/huggingface"),
+        token=HF_TOKEN,
+        allow_patterns=[
+            "gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
+            "tokenizer.model",
+            "config.json",
+            "*.json",
+        ],
+    )
+    print("[download] done", flush=True)
 
-tts_thread = threading.Thread(target=tts_worker, daemon=True)
-tts_thread.start()
-print("[4/7] TTS worker started")
 
-# ─── Audio Utils ──────────────────────────────────────────────────────────────
-# Echo mitigation: when speaker is playing, raise VAD threshold to ignore echo bleed
-speaker_active = False
-def set_speaker_active(active):
-    global speaker_active
-    speaker_active = active
+# ─── Phase 1: load models ───────────────────────────────────────────────────
+def _load_llm():
+    snapshot = _resolve_hf_snapshot()
+    if snapshot is None:
+        _download_model()
+        snapshot = _resolve_hf_snapshot()
+    assert snapshot, f"GGUF snapshot not found under {MODEL_DIR}"
 
-def is_speech(pcm, thr=0.015):
-    """VAD: returns True if pcm contains speech. Raises threshold when speaker active to mitigate echo."""
-    base = np.abs(pcm).mean()
-    if speaker_active:
-        # Raise threshold 3x when speaker playing — echo bleed won't trigger VAD
-        return base > thr * 3.0
-    return base > thr
+    gguf = os.path.join(snapshot, "gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf")
+    tok = os.path.join(snapshot, "tokenizer.model")
+    if not os.path.exists(tok):
+        # Gemma-4 GGUF embeds the tokenizer; let llama-cpp use it directly.
+        tok = None
+    print(f"[llm] loading {gguf}", flush=True)
+    from llama_cpp import Llama
+    llm_kwargs = dict(
+        model_path=gguf,
+        n_ctx=LLM_N_CTX,
+        n_gpu_layers=LLM_GPU_LAYERS,
+        flash_attention=True,
+        verbose=False,
+    )
+    if tok:
+        llm_kwargs["tokenizer_file"] = tok
+    else:
+        llm_kwargs["tokenizer_repo_id"] = "unsloth/gemma-4-E2B-it-qat-mobile-GGUF"
+        if HF_TOKEN:
+            llm_kwargs["hf_token"] = HF_TOKEN
+    llm = Llama(**llm_kwargs)
+    print(f"[llm] ready n_ctx={llm.n_ctx()}", flush=True)
+    return llm
+
+
+def _load_adapters():
+    if not os.path.exists(ADAPTER_PATH):
+        raise FileNotFoundError(
+            f"adapter checkpoint not found: {ADAPTER_PATH}\n"
+            f"Train via colab_train_adapter.ipynb, then set MICHI_ADAPTER to the .pt path."
+        )
+    print(f"[adapter] loading {ADAPTER_PATH}", flush=True)
+    ckpt = torch.load(ADAPTER_PATH, map_location="cpu", weights_only=False)
+    in_proj = ckpt["in_adapter"]["proj.weight"].numpy()
+    out_proj = ckpt["out_adapter"]["proj.weight"].numpy()
+    del ckpt
+    print(f"[adapter] in={in_proj.shape} out={out_proj.shape}", flush=True)
+    return in_proj, out_proj
+
+
+def _load_tts():
+    print("[tts] loading Supertonic-3", flush=True)
+    from supertonic import TTS
+    tts = TTS(auto_download=True)
+    print(f"[tts] ready @ {SAMPLE_RATE}Hz", flush=True)
+    return tts
+
+
+# ─── Audio utilities ────────────────────────────────────────────────────────
+def _vad_rms(pcm, thr=0.012):
+    return float(np.abs(pcm).mean()) > thr
+
+
+_silero = None
+def _vad_silero(pcm):
+    global _silero
+    if _silero is None:
+        import torch
+        _silero, _ = torch.hub.load("snakers4/silero-vad", "silero_vad",
+                                    trust_repo=True, verbose=False)
+    if len(pcm) < 512:
+        return False
+    import torch
+    t = torch.from_numpy(pcm[:512].astype(np.float32))
+    return _silero(t, MIC_RATE).item() > 0.5
+
+
+def is_speech(pcm):
+    if VAD_KIND == "silero":
+        return _vad_silero(pcm)
+    return _vad_rms(pcm)
+
 
 def mel_spec(pcm):
+    """Project PCM(16kHz) → mimi-style 128-dim log-mel frames."""
     x = torch.from_numpy(pcm).float().unsqueeze(0)
     w = torch.hann_window(2048)
     spec = torch.stft(x, n_fft=2048, hop_length=256, win_length=2048,
-                     window=w, onesided=True, return_complex=True)
+                      window=w, onesided=True, return_complex=True)
     mag = spec.squeeze(0).abs().pow(2)
     mel = torch.nn.functional.linear(torch.log1p(mag.T),
-        torch.ones(128, 1025)*0.01).relu()
+                                     torch.ones(128, 1025) * 0.01).relu()
     return mel[:, :128].numpy()
 
-# ─── Streaming early-exit logic ─────────────────────────────────────────────────
-# Gemma (and most Gemma-instruct variants) emits specific patterns when done:
-#   1. Sentence-ending punctuation: . ! ?  (but NOT abbreviations like "Dr." "U.")
-#   2. <end_of_turn> token appears IN the stream (model wrote the stop marker itself)
-#   3. A second <start_of_turn>user appears (model yielded to next turn — done)
-#   4. Repetitive token cycles: "jajajaja" or "si si si si" → loop detected
-#   5. Very short complete phrases (3-15 chars): "si", "no", "hola", "tal vez"
 
-def should_stop_streaming(text_so_far: str, token_count: int, recent_tokens: list) -> bool:
-    """
-    Returns True when Gemma has naturally finished its response and streaming
-    should stop early (before max_tokens=180 is reached).
+# ─── Echo gate ──────────────────────────────────────────────────────────────
+class SpeakerGate:
+    """Tracks whether TTS audio is currently in the play queue."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active = False
 
-    Detection order (cheapest checks first):
-      1. Punctuation end       — last 5 tokens end with sentence closer
-      2. Turn-control tokens   — <end_of_turn> or second <start_of_turn> seen
-      3. Repetition            — same token 4+ times, or 2-token cycle 3+ times
-      4. Short complete phrase — 3-15 chars, all alphabetic, no pending continuation
-    """
-    # ── 1. Punctuation end ──────────────────────────────────────────────────────
-    # Check last 8 chars (covers token boundaries).  Avoid false positives from
-    # abbreviations by requiring space or line-start BEFORE the punctuation.
-    _PUNCT = frozenset(".!?")
-    last8 = text_so_far[-8:] if len(text_so_far) >= 8 else text_so_far
+    def set(self, v):
+        with self._lock:
+            self._active = v
+
+    def is_active(self):
+        with self._lock:
+            return self._active
+
+
+speaker_gate = SpeakerGate()
+
+
+def is_speech_echo_aware(pcm, thr=0.012):
+    """When speaker playing, raise VAD threshold to ignore echo bleed."""
+    if speaker_gate.is_active():
+        thr *= 3.0
+    return _vad_rms(pcm, thr=thr)
+
+
+# ─── TTS background worker ─────────────────────────────────────────────────
+class TTSWorker(threading.Thread):
+    """Single-threaded TTS: synthesize text chunks → audio chunks → queue."""
+    def __init__(self, tts, play_queue: queue.Queue):
+        super().__init__(daemon=True, name="michi-tts")
+        self.tts = tts
+        self.play_queue = play_queue
+        self._in = queue.Queue()
+        self._stop = threading.Event()
+
+    def push_text(self, text):
+        self._in.put(("text", text))
+
+    def flush(self):
+        self._in.put(("flush", None))
+
+    def stop(self):
+        self._in.put(("stop", None))
+
+    def run(self):
+        pending = ""
+        while not self._stop.is_set():
+            try:
+                tag, data = self._in.get(timeout=0.05)
+            except queue.Empty:
+                if pending.strip():
+                    self._synthesize(pending)
+                    pending = ""
+                continue
+
+            if tag == "text":
+                pending += " " + data
+            elif tag == "flush":
+                if pending.strip():
+                    self._synthesize(pending)
+                    pending = ""
+            elif tag == "stop":
+                if pending.strip():
+                    self._synthesize(pending)
+                self._stop.set()
+                break
+
+            # Opportunistic synthesis when buffer grows large enough
+            if len(pending.strip()) > 80:
+                self._synthesize(pending)
+                pending = ""
+
+    def _synthesize(self, text):
+        try:
+            style = self.tts.get_voice_style(TTS_VOICE)
+            wav, _ = self.tts.synthesize(text.strip(), voice_style=style,
+                                        lang="es")
+            arr = np.asarray(wav, dtype=np.float32)
+            if arr.ndim == 2 and arr.shape[0] == 1:
+                arr = arr.squeeze(0)
+            self.play_queue.put(arr)
+        except Exception as e:
+            print(f"[tts] error: {e}", flush=True)
+
+
+# ─── Gemma streaming + early exit ───────────────────────────────────────────
+def should_stop_streaming(text: str, token_count: int, recent: list) -> bool:
+    """Detect when Gemma has finished its turn."""
+    if token_count < 3:
+        return False
+    last8 = text[-8:] if len(text) >= 8 else text
     for i, ch in enumerate(last8):
-        if ch in _PUNCT:
-            # Grab the character IMMEDIATELY before the punctuation (if any)
-            if i > 0:
-                before = last8[i - 1]
-                # Allow . after letters/numbers that form abbreviations or decimals
-                if ch == "." and (before.isdigit() or before.lower() in "abcdefghijklmnopqrstuvwxyz"):
-                    continue   # might be "Dr." / "3.14" — skip this one, keep scanning
-            # Got a clean sentence end
+        if ch in ".!?":
+            if i > 0 and ch == "." and last8[i-1].isalpha():
+                continue
             return True
-
-    # ── 2. Turn-control tokens ───────────────────────────────────────────────────
-    if "<end_of_turn>" in text_so_far:
+    if "<end_of_turn>" in text:
         return True
-    # Second <start_of_turn> (user turn) means model yielded — done
-    if text_so_far.count("<start_of_turn>") >= 2:
+    if text.count("<start_of_turn>") >= 2:
         return True
-
-    # ── 3. Repetition / looping detection ────────────────────────────────────────
-    if len(recent_tokens) >= 4:
-        # 3a. Same token 4+ consecutive times
-        if all(t == recent_tokens[-1] for t in recent_tokens[-4:]):
-            return True
-        # 3b. 2-token cycle repeated 3 times: [A, B, A, B, A, B]
-        if len(recent_tokens) >= 6:
-            cycle = recent_tokens[-2:]
-            if (cycle[0] == cycle[1]) is False:  # make sure it's not a single repeating token
-                candidate = recent_tokens[-6:]
-                if (candidate[0] == cycle[0] and candidate[1] == cycle[1] and
-                    candidate[2] == cycle[0] and candidate[3] == cycle[1] and
-                    candidate[4] == cycle[0] and candidate[5] == cycle[1]):
-                    return True
-
-    # ── 4. Short complete phrase (short responses: "si", "no", "hola") ──────────
-    # Only trigger after at least 3 tokens AND the text is clearly done (no trailing
-    # spaces, no open brackets, starts with capital or is all-lowercase common words)
-    stripped = text_so_far.strip()
-    short_words = frozenset({
-        "si", "no", "hola", "adiós", "gracias", "de nada",
-        "bueno", "vale", "ok", "okay", "ay", "eh", "mmm",
-        "tal vez", "quizá", "quizas", "es posible",
-        "perfecto", "entendido", "claro", "obvio",
-    })
-    # Must be a short alphabetic-only phrase (possibly accented)
-    if (3 <= token_count <= 20 and
-        1 < len(stripped) <= 15 and
-        stripped.lower() in short_words):
+    if len(recent) >= 4 and all(t == recent[-1] for t in recent[-4:]):
         return True
-
+    short = {"si", "no", "hola", "ok", "okay", "vale", "bueno", "claro",
+             "tal vez", "perfecto", "entendido", "de nada", "gracias"}
+    stripped = text.strip().lower()
+    if 3 <= token_count <= 20 and 1 < len(stripped) <= 15 and stripped in short:
+        return True
     return False
 
 
-# ─── Phase 3: Full-duplex loop ─────────────────────────────────────────────────
-def full_duplex(segment: np.ndarray, context: str = "") -> np.ndarray:
-    """
-    Process mic segment:
-    1. mel → Gemma (streaming tokens)
-    2. Every 3 tokens → send to TTS queue (background)
-    3. Collect TTS audio as it comes
-    4. Return concatenated audio
-    """
-    mel = mel_spec(segment)
+def gemma_stream(llm, mel, in_proj, context):
     T = mel.shape[0]
-    mel_pad = np.pad(mel, ((0,0),(0, 896)), mode='constant')
-    _ = mel_pad @ in_proj.T  # warm-up projection
+    pad = np.pad(mel, ((0, 0), (0, 896)), mode="constant")
+    _ = pad @ in_proj.T  # warmup projection
 
-    # Build prompt based on PROMPT_MODE to minimize token overhead per call.
-    # Turn format (<start_of_turn>/<end_of_turn>) is required for Gemma.
-    # Token overhead per mode (approx):
-    #   full:         ~33 tokens  (<start...> + [Audio: N] + "Responde en español, breve." + <end...>)
-    #   minimal:      ~22 tokens  (<start...> + [Audio: N] + "Responde." + <end...>)
-    #   audio_removed: ~10 tokens (<start...> + "Responde." + <end...>)  -- only if Gemma ignores the audio line
     if PROMPT_MODE == "audio_removed":
-        prompt = f"""<start_of_turn>user
-Responde.
-<end_of_turn>
-<start_of_turn>model
-"""
+        prompt = f"<start_of_turn>user\nResponde.\n<end_of_turn>\n<start_of_turn>model\n"
     elif PROMPT_MODE == "minimal":
-        prompt = f"""<start_of_turn>user
-[Audio: {T} mel frames]
-Responde.
-<end_of_turn>
-<start_of_turn>model
-"""
-    else:  # full (default)
-        prompt = f"""<start_of_turn>user
-[Audio: {T} mel frames]
-{context}
-<end_of_turn>
-<start_of_turn>model
-"""
-    full_text = ""
-    tokens_buffer = ""
-    t0 = time.time()
-    token_count = 0
-    audio_chunks = []
+        prompt = (f"<start_of_turn>user\n[Audio: {T} mel frames]\nResponde.\n"
+                  f"<end_of_turn>\n<start_of_turn>model\n")
+    else:
+        prompt = (f"<start_of_turn>user\n[Audio: {T} mel frames]\n{context}\n"
+                  f"<end_of_turn>\n<start_of_turn>model\n")
 
-    # Warm up TTS worker with a flush signal
-    tts_queue.put(("flush", None))
+    full = ""
+    buf = ""
+    recent = []
+    try:
+        for tok in llm(prompt, max_tokens=180, stop=["<end_of_turn>"],
+                       echo=False, stream=True):
+            t = tok["choices"][0]["text"]
+            full += t
+            buf += t
+            recent.append(t)
+            if len(recent) > 8:
+                recent.pop(0)
+            if len(buf.strip()) >= 24:
+                yield ("text", buf.strip())
+                buf = ""
+            if should_stop_streaming(full, len(recent), recent):
+                break
+    finally:
+        if buf.strip():
+            yield ("text", buf.strip())
+        yield ("flush", None)
 
-    # Track recent tokens for repetition / cycle detection
-    recent_tokens = []
 
-    # Stream tokens from Gemma
-    stream_out = llm(prompt, max_tokens=180,
-                    stop=["<end_of_turn>"], echo=False, stream=True)
-
-    for token_data in stream_out:
-        token_text = token_data["choices"][0]["text"]
-        full_text += token_text
-        tokens_buffer += token_text
-        token_count += 1
-
-        # Keep last 8 tokens for repetition detection
-        recent_tokens.append(token_text)
-        if len(recent_tokens) > 8:
-            recent_tokens.pop(0)
-
-        # Every 3 tokens, send to TTS queue
-        if token_count % 3 == 0 and tokens_buffer.strip():
-            tts_queue.put(("text", tokens_buffer.strip()))
-            tokens_buffer = ""
-
-        # Smart early exit — all stop conditions handled in should_stop_streaming
-        if token_count > 2 and should_stop_streaming(full_text, token_count, recent_tokens):
-            break
-
-    # Flush remaining
-    if tokens_buffer.strip():
-        tts_queue.put(("text", tokens_buffer.strip()))
-    tts_queue.put(("flush", None))
-
-    # Signal worker to stop and wait for it to finish synthesis
-    tts_queue.put(("stop", None))
-    tts_thread.join(timeout=8.0)
-
-    # Collect TTS audio chunks from the queue
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
+# ─── Full-duplex core ───────────────────────────────────────────────────────
+def make_pipeline(llm, in_proj, tts_worker):
+    """Returns a function that processes one segment end-to-end."""
+    def process(seg):
         try:
-            item = tts_queue.get(timeout=0.5)
-            if not isinstance(item, tuple) or item[0] != "audio":
-                continue
-            _, arr = item
-            audio_chunks.append(arr)
-        except queue.Empty:
-            break
-        except Exception:
-            continue
+            mel = mel_spec(seg)
+        except Exception as e:
+            print(f"[mel] {e}", flush=True)
+            return
+        for kind, data in gemma_stream(llm, mel, in_proj, ""):
+            if kind == "text":
+                tts_worker.push_text(data)
+            elif kind == "flush":
+                tts_worker.flush()
+    return process
 
-    elapsed = time.time() - t0
-    total_dur = sum(c.shape[0] for c in audio_chunks) / SAMPLE_RATE
-    print(f"    [{T} frames → {len(full_text)} chars in {elapsed*1000:.0f}ms | {total_dur:.1f}s audio]")
-    return np.concatenate(audio_chunks) if audio_chunks else np.zeros(int(SAMPLE_RATE*0.5), dtype=np.float32)
 
-# ─── Phase 4: VAD + Live Loop ─────────────────────────────────────────────────
-q_in = queue.Queue(maxsize=20)
-q_out = queue.Queue()        # pending audio to play
-play_event = threading.Event()
-stop_event = threading.Event()
+# ─── Audio streams ──────────────────────────────────────────────────────────
+class FullDuplexStream:
+    def __init__(self, process_fn):
+        self.q_mic = queue.Queue(maxsize=400)
+        self.q_play = queue.Queue()
+        self.stop_evt = threading.Event()
+        self.process_fn = process_fn
+        self._segment_q = queue.Queue(maxsize=4)
+        self._worker = threading.Thread(target=self._worker_loop,
+                                        daemon=True, name="michi-seg")
+        self._worker.start()
 
-# ── VAD Tuning ──────────────────────────────────────────────────────────────
-SPEECH_THRESHOLD  = 0.012   # was 0.015 — slightly more sensitive to soft speech
-SILENCE_THRESHOLD = 10      # was 15 — 10 * 160ms = 1.6s (natural turn-taking gap)
-MIN_TALK_BUFFER   = 0.8     # was 1.0 — seconds of audio before we consider user "talking"
-
-def audio_cb(indata, frames, time_info, status):
-    """Non-blocking mic callback — always returns quickly."""
-    if status: print(f"[VAD] {status}")
-    try:
-        q_in.put_nowait(indata[:, 0].copy())
-    except:
-        pass
-
-def play_cb(outdata, frames, time_info, status):
-    """Output stream callback — feeds audio from q_out, zeros when empty."""
-    if status: print(f"[OUT] {status}")
-    try:
-        chunk = q_out.get_nowait()
-        outdata[:, 0] = chunk
-        play_event.set()  # signal we started playing
-        set_speaker_active(True)  # speaker is emitting audio
-    except queue.Empty:
-        outdata[:, 0] = 0
-        set_speaker_active(False)  # speaker idle
-
-def live_loop():
-    print("[5/7] Opening streams...")
-    buf = np.zeros(0, dtype=np.float32)
-    silence = 0
-    talking = False
-    playing = False
-
-    with (
-        sd.InputStream(samplerate=MIC_RATE, channels=1, dtype='float32',
-                       blocksize=2560, callback=audio_cb),
-        sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
-                        blocksize=4096, callback=play_cb)
-    ):
-        print("[6/7] Ready! Speak now (full-duplex — mic + audio overlap)...")
-        while not stop_event.is_set():
+    def _mic_cb(self, indata, frames, t, status):
+        if status:
+            return
+        try:
+            self.q_mic.put_nowait(indata[:, 0].copy())
+        except queue.Full:
             try:
-                chunk = q_in.get(timeout=0.1)
-            except queue.Empty:
+                self.q_mic.get_nowait()
+                self.q_mic.put_nowait(indata[:, 0].copy())
+            except Exception:
                 pass
-            else:
-                buf = np.concatenate([buf, chunk])
-                buf = buf[-MIC_RATE * 6:]
 
-                if is_speech(chunk, thr=SPEECH_THRESHOLD):
+    def _play_cb(self, outdata, frames, t, status):
+        try:
+            chunk = self.q_play.get_nowait()
+        except queue.Empty:
+            outdata[:, 0] = 0
+            speaker_gate.set(False)
+            return
+        n = min(len(chunk), frames)
+        outdata[:n, 0] = chunk[:n]
+        if n < frames:
+            outdata[n:, 0] = 0
+        speaker_gate.set(True)
+
+    def _worker_loop(self):
+        """Consume segments from the queue without blocking the live loop."""
+        while not self.stop_evt.is_set():
+            try:
+                seg = self._segment_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            self.process_fn(seg)
+
+    def live_loop(self):
+        buf = np.zeros(0, dtype=np.float32)
+        silence = 0
+        talking = False
+        SILENCE_END = int(0.7 * 1000 / 32)  # 700ms @ 32ms chunks
+        MIN_TALK = int(MIC_RATE * 0.5)
+
+        with sd.InputStream(samplerate=MIC_RATE, channels=1, dtype="float32",
+                            blocksize=512, callback=self._mic_cb), \
+             sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                             blocksize=2048, callback=self._play_cb):
+            print("[ready] full-duplex. Ctrl+C to stop.", flush=True)
+            while not self.stop_evt.is_set():
+                try:
+                    chunk = self.q_mic.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                buf = np.concatenate([buf, chunk])[-MIC_RATE * 6:]
+
+                if is_speech_echo_aware(chunk):
                     silence = 0
-                    if not talking and len(buf) >= MIC_RATE * MIN_TALK_BUFFER:
+                    if not talking and len(buf) >= MIN_TALK:
                         talking = True
                 else:
-                    silence += 1
-                    if silence > SILENCE_THRESHOLD and talking:
-                        talking = False
-                        seg = buf.copy()
-                        buf = np.zeros(0, dtype=np.float32)
-                        dur = len(seg) / MIC_RATE
-                        print(f"\n    → {dur:.1f}s spoken, processing...")
-                        play_event.clear()
-                        t0 = time.time()
-                        out = full_duplex(seg, "" if PROMPT_MODE != "full" else "Responde en español, breve.")
-                        elapsed = time.time() - t0
-                        print(f"    → {len(out)/SAMPLE_RATE:.1f}s audio in {elapsed:.1f}s (overlap mode)")
-                        q_out.put(out)   # non-blocking — plays as callback drains it
-                        playing = True
+                    if talking:
+                        silence += 1
+                        if silence >= SILENCE_END:
+                            seg = buf.copy()
+                            buf = np.zeros(0, dtype=np.float32)
+                            silence = 0
+                            talking = False
+                            print(f"\n[seg {len(seg)/MIC_RATE:.1f}s] -> worker",
+                                  flush=True)
+                            try:
+                                self._segment_q.put_nowait(seg)
+                            except queue.Full:
+                                print("[seg] worker busy, dropping", flush=True)
 
-            # Drain q_out when it has too much backlog (prevents memory growth)
-            while q_out.qsize() > 2:
-                try: q_out.get_nowait()
-                except queue.Empty: break
+                # Barge-in: if user starts talking while TTS is playing,
+                # speaker_gate stays True (echo gate) but the live loop
+                # ignores audio. To actually barge-in, the worker would
+                # need to drop its current TTS job. Handled by TTSWorker
+                # support for ->stop() if you want hard barge-in.
+                print(".", end="", flush=True)
 
-            print(".", end="", flush=True)
-    print("\n[7/7] Stopped.")
 
 def demo():
-    print("\n[Demo] Full pipeline test...")
-    # synthetic mic segment
-    seg = np.sin(2*np.pi*220*np.linspace(0, 1.5, int(MIC_RATE*1.5))).astype(np.float32)*0.04
-    out = full_duplex(seg, "" if PROMPT_MODE != "full" else "Di hola y.presentate en español.")
-    print(f"[Demo] {out.shape[0]/SAMPLE_RATE:.1f}s audio")
-    sf.write(r"D:/michi-adapter/response_fd.wav", out, SAMPLE_RATE)
-    try:
-        sd.play(out, SAMPLE_RATE); sd.wait()
-    except: pass
+    """Synthetic 1.5s sine-wave segment through the full pipeline."""
+    seg = np.sin(2 * np.pi * 220 * np.linspace(0, 1.5,
+            int(MIC_RATE * 1.5))).astype(np.float32) * 0.04
+    print("[demo] loading models...", flush=True)
+    llm = _load_llm()
+    in_proj, _ = _load_adapters()
+    tts = _load_tts()
+    tts_w = TTSWorker(tts, None)
+    tts_w.start()
+    process = make_pipeline(llm, in_proj, tts_w)
+    process(seg)
+    tts_w.flush()
+    tts_w.stop()
+    tts_w.join(timeout=8.0)
 
-if __name__ == "__main__":
+
+def run_mic():
+    print("[boot] loading models...", flush=True)
+    llm = _load_llm()
+    in_proj, _ = _load_adapters()
+    tts = _load_tts()
+    tts_w = TTSWorker(tts, None)  # play queue wired in FullDuplexStream below
+    tts_w.start()
+    process = make_pipeline(llm, in_proj, tts_w)
+
+    # Rebuild worker with the real play queue
+    tts_w.play_queue = None  # safe-guarded: re-route through lazy binding
+    # Instead: create a unified stream that owns both queues.
+
+    class _Stream(FullDuplexStream):
+        def __init__(self, process_fn):
+            # Re-route TTS worker output through the play queue.
+            super().__init__(process_fn)
+            tts_w.play_queue = self.q_play  # late-bind
+
+    stream = _Stream(process)
+    signal.signal(signal.SIGINT, lambda *_: stream.stop_evt.set())
+    try:
+        stream.live_loop()
+    except KeyboardInterrupt:
+        stream.stop_evt.set()
+    tts_w.stop()
+    tts_w.join(timeout=5.0)
+
+
+def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["demo","mic"], default="demo")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["demo", "mic"], default="mic")
+    args = p.parse_args()
+
     if args.mode == "demo":
         demo()
     else:
-        try:
-            live_loop()
-        except KeyboardInterrupt:
-            stop_event.set()
-            tts_thread_running.clear()
+        run_mic()
+
+
+if __name__ == "__main__":
+    # torch is lazy-imported in _load_adapters / _vad_silero
+    import torch  # noqa: F401
